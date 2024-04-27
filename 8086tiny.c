@@ -9,14 +9,8 @@
 #include <sys/timeb.h>
 #include <memory.h>
 
-#ifndef _WIN32
 #include <unistd.h>
 #include <fcntl.h>
-#endif
-
-#ifndef NO_GRAPHICS
-#include "SDL.h"
-#endif
 
 // Emulator system constants
 #define IO_PORT_COUNT 0x10000
@@ -141,18 +135,10 @@
 #define CAST(a) *(a*)&
 
 // Keyboard driver for console. This may need changing for UNIX/non-UNIX platforms
-#ifdef _WIN32
-#define KEYBOARD_DRIVER kbhit() && (mem[0x4A6] = getch(), pc_interrupt(7))
-#else
 #define KEYBOARD_DRIVER read(0, mem + 0x4A6, 1) && (int8_asap = (mem[0x4A6] == 0x1B), pc_interrupt(7))
-#endif
 
 // Keyboard driver for SDL
-#ifdef NO_GRAPHICS
 #define SDL_KEYBOARD_DRIVER KEYBOARD_DRIVER
-#else
-#define SDL_KEYBOARD_DRIVER sdl_screen ? SDL_PollEvent(&sdl_event) && (sdl_event.type == SDL_KEYDOWN || sdl_event.type == SDL_KEYUP) && (scratch_uint = sdl_event.key.keysym.unicode, scratch2_uint = sdl_event.key.keysym.mod, CAST(short)mem[0x4A6] = 0x400 + 0x800*!!(scratch2_uint & KMOD_ALT) + 0x1000*!!(scratch2_uint & KMOD_SHIFT) + 0x2000*!!(scratch2_uint & KMOD_CTRL) + 0x4000*(sdl_event.type == SDL_KEYUP) + ((!scratch_uint || scratch_uint > 0x7F) ? sdl_event.key.keysym.sym : scratch_uint), pc_interrupt(7)) : (KEYBOARD_DRIVER)
-#endif
 
 // Global variable definitions
 unsigned char mem[RAM_SIZE], io_ports[IO_PORT_COUNT], *opcode_stream, *regs8, i_rm, i_w, i_reg, i_mod, i_mod_size, i_d, i_reg4bit, raw_opcode_id, xlat_opcode_id, extra, rep_mode, seg_override_en, rep_override_en, trap_flag, int8_asap, scratch_uchar, io_hi_lo, *vid_mem_base, spkr_en, bios_table_lookup[20][256];
@@ -161,13 +147,6 @@ unsigned int op_source, op_dest, rm_addr, op_to_addr, op_from_addr, i_data0, i_d
 int op_result, disk[3], scratch_int;
 time_t clock_buf;
 struct timeb ms_clock;
-
-#ifndef NO_GRAPHICS
-SDL_AudioSpec sdl_audio = {44100, AUDIO_U8, 1, 0, 128};
-SDL_Surface *sdl_screen;
-SDL_Event sdl_event;
-unsigned short vid_addr_lookup[VIDEO_RAM_SIZE], cga_colors[4] = {0 /* Black */, 0x1F1F /* Cyan */, 0xE3E3 /* Magenta */, 0xFFFF /* White */};
-#endif
 
 // Helper functions
 
@@ -245,29 +224,9 @@ int AAA_AAS(char which_operation)
 	return (regs16[REG_AX] += 262 * which_operation*set_AF(set_CF(((regs8[REG_AL] & 0x0F) > 9) || regs8[FLAG_AF])), regs8[REG_AL] &= 0x0F);
 }
 
-#ifndef NO_GRAPHICS
-void audio_callback(void *data, unsigned char *stream, int len)
-{
-	for (int i = 0; i < len; i++)
-		stream[i] = (spkr_en == 3) && CAST(unsigned short)mem[0x4AA] ? -((54 * wave_counter++ / CAST(unsigned short)mem[0x4AA]) & 1) : sdl_audio.silence;
-
-	spkr_en = io_ports[0x61] & 3;
-}
-#endif
-
 // Emulator entry point
 int main(int argc, char **argv)
 {
-#ifndef NO_GRAPHICS
-	// Initialise SDL
-	SDL_Init(SDL_INIT_AUDIO);
-	sdl_audio.callback = audio_callback;
-#ifdef _WIN32
-	sdl_audio.samples = 512;
-#endif
-	SDL_OpenAudio(&sdl_audio, 0);
-#endif
-
 	// regs16 and reg8 point to F000:0, the start of memory-mapped registers. CS is initialised to F000
 	regs16 = (unsigned short *)(regs8 = mem + REGS_BASE);
 	regs16[REG_CS] = 0xF000;
@@ -584,9 +543,6 @@ int main(int argc, char **argv)
 				R_M_OP(io_ports[scratch_uint], =, regs8[REG_AL]);
 				scratch_uint == 0x61 && (io_hi_lo = 0, spkr_en |= regs8[REG_AL] & 3); // Speaker control
 				(scratch_uint == 0x40 || scratch_uint == 0x42) && (io_ports[0x43] & 6) && (mem[0x469 + scratch_uint - (io_hi_lo ^= 1)] = regs8[REG_AL]); // PIT rate programming
-#ifndef NO_GRAPHICS
-				scratch_uint == 0x43 && (io_hi_lo = 0, regs8[REG_AL] >> 6 == 2) && (SDL_PauseAudio((regs8[REG_AL] & 0xF7) != 0xB6), 0); // Speaker enable
-#endif
 				scratch_uint == 0x3D5 && (io_ports[0x3D4] >> 1 == 6) && (mem[0x4AD + !(io_ports[0x3D4] & 1)] = regs8[REG_AL]); // CRT video RAM start offset
 				scratch_uint == 0x3D5 && (io_ports[0x3D4] >> 1 == 7) && (scratch2_uint = ((mem[0x49E]*80 + mem[0x49D] + CAST(short)mem[0x4AD]) & (io_ports[0x3D4] & 1 ? 0xFF00 : 0xFF)) + (regs8[REG_AL] << (io_ports[0x3D4] & 1 ? 0 : 8)) - CAST(short)mem[0x4AD], mem[0x49D] = scratch2_uint % 80, mem[0x49E] = scratch2_uint / 80); // CRT cursor position
 				scratch_uint == 0x3B5 && io_ports[0x3B4] == 1 && (GRAPHICS_X = regs8[REG_AL] * 16); // Hercules resolution reprogramming. Defaults are set in the BIOS
@@ -701,46 +657,6 @@ int main(int argc, char **argv)
 		if (!(++inst_counter % KEYBOARD_TIMER_UPDATE_DELAY))
 			int8_asap = 1;
 
-#ifndef NO_GRAPHICS
-		// Update the video graphics display every GRAPHICS_UPDATE_DELAY instructions
-		if (!(inst_counter % GRAPHICS_UPDATE_DELAY))
-		{
-			// Video card in graphics mode?
-			if (io_ports[0x3B8] & 2)
-			{
-				// If we don't already have an SDL window open, set it up and compute color and video memory translation tables
-				if (!sdl_screen)
-				{
-					for (int i = 0; i < 16; i++)
-						pixel_colors[i] = mem[0x4AC] ? // CGA?
-							cga_colors[(i & 12) >> 2] + (cga_colors[i & 3] << 16) // CGA -> RGB332
-							: 0xFF*(((i & 1) << 24) + ((i & 2) << 15) + ((i & 4) << 6) + ((i & 8) >> 3)); // Hercules -> RGB332
-
-					for (int i = 0; i < GRAPHICS_X * GRAPHICS_Y / 4; i++)
-						vid_addr_lookup[i] = i / GRAPHICS_X * (GRAPHICS_X / 8) + (i / 2) % (GRAPHICS_X / 8) + 0x2000*(mem[0x4AC] ? (2 * i / GRAPHICS_X) % 2 : (4 * i / GRAPHICS_X) % 4);
-
-					SDL_Init(SDL_INIT_VIDEO);
-					sdl_screen = SDL_SetVideoMode(GRAPHICS_X, GRAPHICS_Y, 8, 0);
-					SDL_EnableUNICODE(1);
-					SDL_EnableKeyRepeat(500, 30);
-				}
-
-				// Refresh SDL display from emulated graphics card video RAM
-				vid_mem_base = mem + 0xB0000 + 0x8000*(mem[0x4AC] ? 1 : io_ports[0x3B8] >> 7); // B800:0 for CGA/Hercules bank 2, B000:0 for Hercules bank 1
-				for (int i = 0; i < GRAPHICS_X * GRAPHICS_Y / 4; i++)
-					((unsigned *)sdl_screen->pixels)[i] = pixel_colors[15 & (vid_mem_base[vid_addr_lookup[i]] >> 4*!(i & 1))];
-
-				SDL_Flip(sdl_screen);
-			}
-			else if (sdl_screen) // Application has gone back to text mode, so close the SDL window
-			{
-				SDL_QuitSubSystem(SDL_INIT_VIDEO);
-				sdl_screen = 0;
-			}
-			SDL_PumpEvents();
-		}
-#endif
-
 		// Application has set trap flag, so fire INT 1
 		if (trap_flag)
 			pc_interrupt(1);
@@ -753,8 +669,5 @@ int main(int argc, char **argv)
 			pc_interrupt(0xA), int8_asap = 0, SDL_KEYBOARD_DRIVER;
 	}
 
-#ifndef NO_GRAPHICS
-	SDL_Quit();
-#endif
 	return 0;
 }
