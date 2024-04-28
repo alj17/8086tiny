@@ -4,6 +4,7 @@
 // Revision 1.25
 //
 // This work is licensed under the MIT License. See included LICENSE.TXT.
+#include <stdio.h>
 
 #include <time.h>
 #include <sys/timeb.h>
@@ -11,6 +12,10 @@
 
 #include <unistd.h>
 #include <fcntl.h>
+
+#include <stdint.h>
+
+#include "regs8086.h"
 
 // Emulator system constants
 #define IO_PORT_COUNT 0x10000
@@ -23,45 +28,6 @@
 #define GRAPHICS_UPDATE_DELAY 360000
 #endif
 #define KEYBOARD_TIMER_UPDATE_DELAY 20000
-
-// 16-bit register decodes
-#define REG_AX 0
-#define REG_CX 1
-#define REG_DX 2
-#define REG_BX 3
-#define REG_SP 4
-#define REG_BP 5
-#define REG_SI 6
-#define REG_DI 7
-
-#define REG_ES 8
-#define REG_CS 9
-#define REG_SS 10
-#define REG_DS 11
-
-#define REG_ZERO 12
-#define REG_SCRATCH 13
-
-// 8-bit register decodes
-#define REG_AL 0
-#define REG_AH 1
-#define REG_CL 2
-#define REG_CH 3
-#define REG_DL 4
-#define REG_DH 5
-#define REG_BL 6
-#define REG_BH 7
-
-// FLAGS register decodes
-#define FLAG_CF 40
-#define FLAG_PF 41
-#define FLAG_AF 42
-#define FLAG_ZF 43
-#define FLAG_SF 44
-#define FLAG_TF 45
-#define FLAG_IF 46
-#define FLAG_DF 47
-#define FLAG_OF 48
 
 // Lookup tables in the BIOS binary
 #define TABLE_XLAT_OPCODE 8
@@ -100,6 +66,23 @@
 #define OPCODE ;break; case
 #define OPCODE_CHAIN ; case
 
+static uint8_t xlat_opcode_id;
+static uint8_t bios_table_lookup[20][256];
+static uint8_t raw_opcode_id;
+static uint8_t extra;
+static uint8_t i_mod_size;
+
+static unsigned set_flags_type;
+
+// Convert raw opcode to translated opcode index. This condenses a large number of different encodings of similar
+// instructions into a much smaller number of distinct functions, which we then execute
+static void set_opcode(unsigned char opcode) {
+	xlat_opcode_id = bios_table_lookup[TABLE_XLAT_OPCODE][raw_opcode_id = opcode];
+	extra = bios_table_lookup[TABLE_XLAT_SUBFUNCTION][opcode];
+	i_mod_size = bios_table_lookup[TABLE_I_MOD_SIZE][opcode];
+	set_flags_type = bios_table_lookup[TABLE_STD_FLAGS][opcode];
+}
+
 // [I]MUL/[I]DIV/DAA/DAS/ADC/SBB helpers
 #define MUL_MACRO(op_data_type,out_regs) (set_opcode(0x10), \
 										  out_regs[i_w + 1] = (op_result = CAST(op_data_type)mem[rm_addr] * (op_data_type)*out_regs) >> 16, \
@@ -134,16 +117,10 @@
 // Reinterpretation cast
 #define CAST(a) *(a*)&
 
-// Keyboard driver for console. This may need changing for UNIX/non-UNIX platforms
-#define KEYBOARD_DRIVER read(0, mem + 0x4A6, 1) && (int8_asap = (mem[0x4A6] == 0x1B), pc_interrupt(7))
-
-// Keyboard driver for SDL
-#define SDL_KEYBOARD_DRIVER KEYBOARD_DRIVER
-
 // Global variable definitions
-unsigned char mem[RAM_SIZE], io_ports[IO_PORT_COUNT], *opcode_stream, *regs8, i_rm, i_w, i_reg, i_mod, i_mod_size, i_d, i_reg4bit, raw_opcode_id, xlat_opcode_id, extra, rep_mode, seg_override_en, rep_override_en, trap_flag, int8_asap, scratch_uchar, io_hi_lo, *vid_mem_base, spkr_en, bios_table_lookup[20][256];
-unsigned short *regs16, reg_ip, seg_override, file_index, wave_counter;
-unsigned int op_source, op_dest, rm_addr, op_to_addr, op_from_addr, i_data0, i_data1, i_data2, scratch_uint, scratch2_uint, inst_counter, set_flags_type, GRAPHICS_X, GRAPHICS_Y, pixel_colors[16], vmem_ctr;
+static uint8_t mem[RAM_SIZE], io_ports[IO_PORT_COUNT], *opcode_stream, *regs8, i_rm, i_w, i_reg, i_mod, i_d, i_reg4bit, rep_mode, seg_override_en, rep_override_en, trap_flag, int8_asap, scratch_uchar, io_hi_lo, *vid_mem_base, spkr_en, bios_table_lookup[20][256];
+uint16_t *regs16, reg_ip, seg_override, file_index, wave_counter;
+unsigned int op_source, op_dest, rm_addr, op_to_addr, op_from_addr, i_data0, i_data1, i_data2, scratch_uint, scratch2_uint, inst_counter, GRAPHICS_X, GRAPHICS_Y, pixel_colors[16], vmem_ctr;
 int op_result, disk[3], scratch_int;
 time_t clock_buf;
 struct timeb ms_clock;
@@ -151,25 +128,25 @@ struct timeb ms_clock;
 // Helper functions
 
 // Set carry flag
-char set_CF(int new_CF)
+static char set_CF(int new_CF)
 {
 	return regs8[FLAG_CF] = !!new_CF;
 }
 
 // Set auxiliary flag
-char set_AF(int new_AF)
+static char set_AF(int new_AF)
 {
 	return regs8[FLAG_AF] = !!new_AF;
 }
 
 // Set overflow flag
-char set_OF(int new_OF)
+static char set_OF(int new_OF)
 {
 	return regs8[FLAG_OF] = !!new_OF;
 }
 
 // Set auxiliary and overflow flag after arithmetic operations
-char set_AF_OF_arith()
+static char set_AF_OF_arith()
 {
 	set_AF((op_source ^= op_dest ^ op_result) & 0x10);
 	if (op_result == op_dest)
@@ -193,24 +170,47 @@ void set_flags(int new_flags)
 		regs8[FLAG_CF + i] = !!(1 << bios_table_lookup[TABLE_FLAGS_BITFIELDS][i] & new_flags);
 }
 
-// Convert raw opcode to translated opcode index. This condenses a large number of different encodings of similar
-// instructions into a much smaller number of distinct functions, which we then execute
-void set_opcode(unsigned char opcode)
-{
-	xlat_opcode_id = bios_table_lookup[TABLE_XLAT_OPCODE][raw_opcode_id = opcode];
-	extra = bios_table_lookup[TABLE_XLAT_SUBFUNCTION][opcode];
-	i_mod_size = bios_table_lookup[TABLE_I_MOD_SIZE][opcode];
-	set_flags_type = bios_table_lookup[TABLE_STD_FLAGS][opcode];
+static void memww(uint8_t *mem, uint16_t w) {
+	mem[0] = w;
+	mem[1] = w >> 8;
+}
+
+static void memw16le(uint16_t *mem, uint16_t val) {
+	memww((uint8_t *) mem, val);
+}
+
+// read a memory word from byte memory
+static uint16_t memrw(uint8_t *mem) {
+	const uint16_t vl = mem[0];
+	const uint16_t vh = mem[1];
+
+	return (vh << 8) | vl;
+}
+
+// read a memory word from word memory
+static uint16_t memr16le(uint16_t *mem) {
+	return memrw((uint8_t *) mem);
+}
+
+static void memw32le(uint32_t *mem, uint32_t val) {
+	uint8_t *mem8 = (uint8_t *) mem;
+
+	mem8[0] = val;
+	mem8[1] = (val >> 8);
+	mem8[2] = (val >> 16);
+	mem8[3] = (val >> 24);
 }
 
 // Execute INT #interrupt_num on the emulated machine
 char pc_interrupt(unsigned char interrupt_num)
 {
+	uint16_t val;
 	set_opcode(0xCD); // Decode like INT
 
 	make_flags();
 	R_M_PUSH(scratch_uint);
-	R_M_PUSH(regs16[REG_CS]);
+	val = memr16le(regs16 + REG_CS);
+	R_M_PUSH(val);
 	R_M_PUSH(reg_ip);
 	MEM_OP(REGS_BASE + 2 * REG_CS, =, 4 * interrupt_num + 2);
 	R_M_OP(reg_ip, =, mem[4 * interrupt_num]);
@@ -224,12 +224,483 @@ int AAA_AAS(char which_operation)
 	return (regs16[REG_AX] += 262 * which_operation*set_AF(set_CF(((regs8[REG_AL] & 0x0F) > 9) || regs8[FLAG_AF])), regs8[REG_AL] &= 0x0F);
 }
 
+/* return 20 bit linear address */
+static uint32_t linear(uint16_t seg, uint16_t ofs) {
+	const uint32_t sr = seg;
+	const uint32_t so = ofs;
+
+	return (sr << 4) + so;
+}
+
+static const char *reg16name(uint8_t reg) {
+	const char *regs[] = { "AX", "CX", "DX", "BX", "SP", "BP", "SI", "DI" };
+
+	return regs[reg&7];
+}
+
+static const char *reg8name(uint8_t reg) {
+	const char *regs[] = { "AL", "AH", "CL", "CH", "DL", "DH", "BL", "BH" };
+
+	return regs[reg&7];
+}
+
+static const char *sregname(uint8_t reg) {
+	const char *regs[] = { "ES", "CS", "SS", "DS" };
+
+	return regs[reg&3];
+}
+
+static unsigned parity(uint8_t val) {
+	unsigned i;
+	unsigned p = 1;
+
+	for (i = 0; i < 8; i++) {
+		if (val & 1) {
+			p = !p;
+		}
+		val = val >> 1;
+	}
+
+	return p;
+}
+
+static void update_flags16(uint16_t result, unsigned carry, unsigned aux, unsigned overflow) {
+	regs8[FLAG_SF] = result & 0x8000;
+	regs8[FLAG_ZF] = result == 0;
+	regs8[FLAG_PF] = parity(result);
+	regs8[FLAG_CF] = carry;
+	regs8[FLAG_AF] = aux;
+	regs8[FLAG_OF] = overflow;
+}
+
+static void add_update_flags8(uint8_t cmp, uint8_t val) {
+	const uint8_t result = cmp + val;
+
+	regs8[FLAG_SF] = result & 0x80;
+	regs8[FLAG_ZF] = result == 0;
+	regs8[FLAG_PF] = parity(result);
+	regs8[FLAG_CF] = (cmp & 0x80) && (val & 0x80);
+	regs8[FLAG_AF] = 0;	// FIXME: how to compute?
+	regs8[FLAG_OF] = 0;	// FIXME: how to compute?
+}
+
+static void add_update_flags16(uint16_t cmp, uint16_t val) {
+	const uint16_t result = cmp + val;
+
+	regs8[FLAG_SF] = result & 0x8000;
+	regs8[FLAG_ZF] = result == 0;
+	regs8[FLAG_PF] = parity(result);
+	regs8[FLAG_CF] = (cmp & 0x8000) && (val & 0x8000);
+	regs8[FLAG_AF] = 0;	// FIXME: how to compute?
+	regs8[FLAG_OF] = 0;	// FIXME: how to compute?
+}
+
+static uint16_t direct_addr(uint8_t *pmem) {
+	uint16_t addr = pmem[1];
+
+	addr <<= 8;
+	addr |= pmem[0];
+
+	return addr;
+}
+
+static uint16_t sign_extend(uint8_t v) {
+	return (int16_t) (int8_t) v;
+}
+
+static void cmpw(uint16_t v1, uint16_t v2) {
+	const uint16_t mv2 = -v2;
+
+	add_update_flags16(v1, mv2);
+}
+
+// jump conditional byte
+static uint16_t jcb(unsigned cond, uint8_t disp) {
+	return (cond) ? sign_extend(disp) + 2 : 2;
+}
+
+static uint16_t decode(uint8_t *mem, uint16_t pc) {
+	uint8_t   *regs8  = mem + REGS_BASE;
+	uint16_t  *regs16 = (uint16_t *) regs8;
+	const uint16_t sp = memr16le(regs16 + REG_SP);
+	const uint16_t bp = memr16le(regs16 + REG_BP);
+	const uint16_t si = memr16le(regs16 + REG_SI);
+	const uint16_t di = memr16le(regs16 + REG_DI);
+	const uint16_t cs = memr16le(regs16 + REG_CS);
+	const uint16_t ds = memr16le(regs16 + REG_DS);
+	const uint16_t ss = memr16le(regs16 + REG_SS);
+	const uint16_t es = memr16le(regs16 + REG_ES);
+	uint8_t     *pmem = mem + linear(cs, pc);
+	unsigned segment_prefix = 0;
+	unsigned segment = 0;			// offset from 0, + REG_ES for register number
+	unsigned lock_prefix = 0;
+	unsigned repeat_prefix = 0;
+	unsigned repeat_zero = 0;
+
+	printf("    O D I T S Z A P C\n");
+	printf("PSW %1x %1x %1x %1x %1x %1x %1x %1x %1x\n\n",
+		regs8[FLAG_OF], regs8[FLAG_DF], regs8[FLAG_IF], regs8[FLAG_TF],
+		regs8[FLAG_SF], regs8[FLAG_ZF], regs8[FLAG_AF], regs8[FLAG_PF],
+		regs8[FLAG_CF]);
+	printf(" AX  %02x %02x        PMem\n", regs8[REG_AH], regs8[REG_AL]);
+	printf(" BX  %02x %02x        %02x\n", regs8[REG_BH], regs8[REG_BL], pmem[0]);
+	printf(" CX  %02x %02x        %02x\n", regs8[REG_CH], regs8[REG_CL], pmem[1]);
+	printf(" DX  %02x %02x        %02x\n", regs8[REG_DH], regs8[REG_DL], pmem[2]);
+	printf(" SP  %02x %02x        %02x\n", sp >> 8, sp & 0xff, pmem[3]);
+	printf(" BP  %02x %02x        %02x\n", bp >> 8, bp & 0xff, pmem[4]);
+	printf(" SI  %02x %02x        %02x\n", si >> 8, si & 0xff, pmem[5]);
+	printf(" DI  %02x %02x        %02x\n", di >> 8, di & 0xff, pmem[6]);
+	printf(" PC  %02x %02x\n", pc >> 8, pc & 0xff);
+	printf(" CS  %02x %02x\n", cs >> 8, cs & 0xff);
+	printf(" DS  %02x %02x\n", ds >> 8, ds & 0xff);
+	printf(" SS  %02x %02x\n", ss >> 8, ss & 0xff);
+	printf(" ES  %02x %02x        ", es >> 8, es & 0xff);
+
+prefix:
+	pmem = mem + linear(cs, pc);
+	if (pmem[0] == 0xeb) {
+		const int16_t offset = (int16_t) ((int8_t) pmem[1]);
+
+		pc = pc + (uint16_t) offset + 2;
+		printf("JMP %02x", pmem[1]);
+	} else if ((pmem[0] & (~0xf)) == 0xb0) {
+		const uint8_t w = (pmem[0] >> 3) & 1;
+		const uint8_t r = pmem[0] & 7;
+
+		if (w) {
+			const uint16_t val = ((uint16_t) pmem[2] << 8) + pmem[1];
+
+			memw16le(regs16 + r, val);
+			printf("MOV %s, %04x", reg16name(r), val);
+		} else {
+			uint8_t map[] = {
+				REG_AL, REG_CL, REG_DL, REG_BL, REG_AH, REG_CH, REG_DH, REG_BH };
+
+			regs8[map[r]] = pmem[1];
+			printf("MOV %s, %02x", reg8name(map[r]), pmem[1]);
+		}
+
+		pc = pc + 2 + w;
+	} else if (pmem[0] == 0x8e) {
+		const uint8_t mod = pmem[1] >> 6;
+		const uint8_t reg = (pmem[1] >> 3) & 7;
+		const uint8_t rm  = pmem[1] & 7;
+
+		if (mod == 3) {
+			uint16_t *dest = NULL;
+
+			// FIXME: validate reg (000, 010, 011 are valid)
+			printf("MOV %s, %s", sregname(reg), reg16name(rm));
+			memw16le(regs16 + REG_ES + reg, memr16le(regs16 + rm));
+		}
+
+		pc = pc + 2;
+	} else if ((pmem[0] & (~3)) == 0x88) {
+		const uint8_t  d    = (pmem[0] >> 1) & 1;
+		const uint8_t  w    = pmem[0] & 1;
+		const uint8_t  mod  = pmem[1] >> 6;
+		const uint8_t  reg  = (pmem[1] >> 3) & 7;
+		const uint8_t  rm   = pmem[1] & 7;
+		const uint16_t segn = (segment_prefix) ? segment : 3;
+		const uint16_t seg  = memr16le(regs16 + REG_ES + segn);
+
+		uint16_t pci = 2;
+
+		if (mod == 0) {
+			if (rm == 6) {
+				const uint16_t addr = direct_addr(pmem + 2);
+
+				if (d) {
+				} else {
+					// src memory
+					if (w) {
+						const uint16_t val = memr16le(regs16 + reg);
+
+						mem[linear(seg, addr)] =  val & 0xff;
+						mem[linear(seg, addr + 1)] =  val >> 8; 
+
+						printf("MOV [%s:%04x], %s", sregname(segn), addr, reg16name(reg));
+					} else {
+						uint8_t map[] = {
+							REG_AL, REG_CL, REG_DL, REG_BL, REG_AH, REG_CH, REG_DH, REG_BH };
+
+						mem[linear(seg, addr)] = regs8[map[reg]];
+						printf("MOV [%s:%04x], %s", sregname(segn), addr, reg8name(map[reg]));
+					}
+					// dst memory
+				}
+				pci = 4;
+			}
+		} else if (mod == 3) {
+			if (d) {
+			} else {
+				if (w) {
+					memw16le(regs16 + rm, memr16le(regs16 + reg));
+					printf("MOV %s, %s", reg16name(rm), reg16name(reg));
+					pci = 2;
+				} else {
+				}
+			}
+		}
+
+		pc = pc + pci;
+	} else if ((pmem[0] & (~1)) == 0xc6) {
+		const uint8_t  w    = pmem[0] & 1;
+		const uint8_t  mod  = pmem[1] >> 6;
+		const uint8_t  reg  = (pmem[1] >> 3) & 7;
+		const uint8_t  rm   = pmem[1] & 7;
+		const uint16_t segn = (segment_prefix) ? segment : 3;
+		const uint16_t seg  = memr16le(regs16 + REG_ES + segn);
+		uint16_t pci = 0;
+
+		if (mod == 0) {
+			if (rm == 6) {
+				const uint16_t addr = direct_addr(pmem + 2);
+
+				if (w) {
+					const uint16_t val = memrw(pmem + 4);
+
+					printf("MOV WORD [%s:%04x], %04x", sregname(segn), addr, val);
+					pci = 6;
+				} else {
+					mem[linear(seg, addr)] = pmem[4];
+					printf("MOV BYTE [%s:%04x], %02x", sregname(segn), addr, pmem[4]);
+					pci = 5;
+				}
+			} else {
+			}
+		} else {
+		}
+
+		pc = pc + pci;
+	} else if ((pmem[0] & (~1)) == 0xa2) {
+		const uint8_t  w    = pmem[0] & 1;
+		const uint16_t segn = (segment_prefix) ? segment : 3;
+		const uint16_t seg  = memr16le(regs16 + REG_ES + segn);
+		const uint16_t addr = memrw(pmem + 1);
+
+		if (w) {
+			const uint16_t val = memr16le(regs16 + REG_AX);
+
+			memww(mem + linear(seg, addr), val);
+			printf("MOV [%s:%04x], AX", sregname(segn), addr);
+		} else {
+			mem[linear(seg, addr)] = regs8[REG_AL];
+			printf("MOV [%s:%04x], AL", sregname(segn), addr);
+		}
+		pc = pc + 3;
+	} else if ((pmem[0] & (~0x18)) == 0x06) {
+		const uint8_t sreg = (pmem[0] >> 3) & 3;
+		const uint16_t val = memr16le(regs16 + REG_ES + sreg);
+		const uint16_t sp  = memr16le(regs16 + REG_SP);
+		const uint16_t ss  = memr16le(regs16 + REG_SS);
+
+		memw16le(regs16 + REG_SP, sp - 1);
+		mem[linear(ss, sp - 1)] = val >> 8;
+		memw16le(regs16 + REG_SP, sp - 2);
+		mem[linear(ss, sp - 2)] = val;
+
+		printf("PUSH %s", sregname(sreg));
+
+		pc = pc + 1;
+	} else if ((pmem[0] & (~0x18)) == 0x07) {
+		const uint8_t sreg = (pmem[0] >> 3) & 3;
+		const uint16_t sp  = memr16le(regs16 + REG_SP);
+		const uint16_t ss  = memr16le(regs16 + REG_SS);
+		uint8_t *sr        = (uint8_t *) (regs16 + REG_ES + sreg);
+
+		sr[0] = mem[linear(ss, sp)];
+		memw16le(regs16 + REG_SP, sp + 1);
+		sr[1] = mem[linear(ss, sp + 1)];
+		memw16le(regs16 + REG_SP, sp + 2);
+
+		printf("POP %s", sregname(sreg));
+
+		pc = pc + 1;
+	} else if ((pmem[0] & (~7)) == 0x58) {
+		const uint8_t  reg = pmem[0] & 7;
+		const uint16_t sp  = memr16le(regs16 + REG_SP);
+		const uint16_t ss  = memr16le(regs16 + REG_SS);
+		const uint16_t vl  = mem[linear(ss, sp)];
+		const uint16_t vh  = mem[linear(ss, sp + 1)];
+
+		memw16le(regs16 + reg, (vh << 8) | vl);
+		memw16le(regs16 + REG_SP, sp + 2);
+		printf("POP %s", reg16name(reg));
+		pc++;
+	} else if ((pmem[0] & (~7)) == 0x50) {
+		const uint8_t reg  = pmem[0] & 7;
+		const uint16_t val = memr16le(regs16 + reg);
+		const uint16_t sp  = memr16le(regs16 + REG_SP);
+		const uint16_t ss  = memr16le(regs16 + REG_SS);
+
+		memw16le(regs16 + REG_SP, sp - 1);
+		mem[linear(ss, sp - 1)] = val >> 8;
+		memw16le(regs16 + REG_SP, sp - 2);
+		mem[linear(ss, sp - 2)] = val;
+
+		printf("PUSH %s", reg16name(reg));
+
+		pc = pc + 1;
+	} else if (pmem[0] == 0xfc) {
+		regs8[FLAG_DF] = 0;
+		printf("CLD");
+		pc = pc + 1;
+	} else if ((pmem[0] & (~3)) == 0x30) {
+		const uint8_t w = pmem[0] & 1;
+		const uint8_t d = (pmem[0] >> 1) & 1;
+		const uint8_t mod = pmem[1] >> 6;
+		const uint8_t reg = (pmem[1] >> 3) & 7;
+		const uint8_t rm  = pmem[1] & 7;
+		const uint8_t src = (d) ? reg : rm;
+		const uint8_t dst = (d) ? rm : reg;
+
+		if (w) {
+			if (mod == 3) {
+				const uint16_t result =
+					memr16le(regs16 + src) ^ memr16le(regs16 + dst);
+
+				memw16le(regs16 + dst, result);
+				update_flags16(result, 0, 0, 0);
+				printf("XOR %s, %s", reg16name(dst), reg16name(src));
+			}
+		}
+
+		pc = pc + 2;
+	} else if ((pmem[0] & (~1)) == 0xaa) {
+		const uint8_t   w = pmem[0] & 1;
+		uint16_t       di = memr16le(regs16 + REG_DI);
+		const uint16_t es = memr16le(regs16 + REG_ES);
+		uint16_t      dii = 0;
+
+		if (w) {
+			const uint16_t val = memr16le(regs16 + REG_AX);
+
+			mem[linear(es, di)] = val & 0xff;
+			mem[linear(es, di + 1)] = val >> 8;
+			dii = 2;
+		} else {
+			mem[linear(es, di)] = regs8[REG_AL];
+			dii = 1;
+		}
+
+		if (regs8[FLAG_DF]) {
+			di -= dii;
+		} else {
+			di += dii;
+		}
+		memw16le(regs16 + REG_DI, di);
+
+		// FIXME: REP+LOCK prefix
+		printf("STOS%c", (w) ? 'W' : 'B');
+		pc = pc + 1;
+	} else if ((pmem[0] & (~0x18)) == 0x26) {
+		segment = (pmem[0] >> 3) & 3;
+		segment_prefix = 1;
+		pc = pc + 1;
+		goto prefix;
+	} else if (pmem[0] == 0xf0) {
+		pc = pc + 1;
+		lock_prefix = 1;
+		goto prefix;
+	} else if (pmem[0] == 0x90) {
+		printf("NOP");
+	} else if ((pmem[0] & (~1)) == 0xf2) {
+		pc = pc + 1;
+		repeat_prefix = 1;
+		repeat_zero = pmem[0] & 1;
+		goto prefix;
+	} else if ((pmem[0] & (~1)) == 0xee) {
+		const uint8_t w = pmem[0] & 1;
+		const uint16_t port = memr16le(regs16 + REG_DX);
+
+		if (w) {
+			const uint16_t val = memr16le(regs16 + REG_AX);
+
+			io_ports[port] = val & 0xff;
+			io_ports[port + 1] = val >> 8;
+			printf("OUT DX, AX");
+		} else {
+			io_ports[port] = regs8[REG_AL];
+			printf("OUT DX, AL");
+		}
+
+		pc = pc + 1;
+	} else if ((pmem[0] & (~3)) == 0x80) {
+		const uint8_t  s   = (pmem[0] >> 1) & 1;
+		const uint8_t  w   = pmem[0] & 1;
+		const uint8_t  mod = pmem[1] >> 6;
+		const uint8_t  reg = (pmem[1] >> 3) & 7;
+		const uint8_t  rm  = pmem[1] & 7;
+		const uint16_t segn = (segment_prefix) ? segment : 3;
+		const uint16_t seg  = memr16le(regs16 + REG_ES + segn);
+		uint16_t pci = 0;
+
+		if (mod == 0) {
+			if (rm == 6) {
+				const uint16_t addr = direct_addr(pmem + 2);
+
+				if (w) {
+					if (s) {
+					} else {
+					}
+				} else {
+					const uint8_t val = -pmem[4];
+					const uint8_t cmp = mem[linear(seg, addr)];
+					const uint8_t result = cmp + val;
+
+					add_update_flags8(cmp, val);
+
+					printf("CMP BYTE [%s:%04x], %02x", sregname(segn), addr, val);
+					pci = 5;
+				}
+			} else {
+			}
+		} else if (mod == 3) {
+			if (w) {
+				const uint16_t v1 = memr16le(regs16 + rm);
+				uint16_t v2 = 0;
+				
+				if (s) {
+					v2 = sign_extend(pmem[2]);
+					pci = 3;
+				} else {
+					v2 = memrw(pmem + 2);
+					pci = 4;
+				}
+				cmpw(v1, v2);
+				printf("CMP %s, %04x", reg16name(rm), v2);
+			} else {
+			}
+		}
+
+		pc = pc + pci;
+	} else if (pmem[0] == 0x74) {
+		pc = pc + jcb(regs8[FLAG_ZF], pmem[1]);
+		printf("JZ %02x", pmem[1]);
+	} else if (pmem[0] == 0x77) {
+		pc = pc + jcb(regs8[FLAG_ZF] && regs8[FLAG_CF], pmem[1]);
+		printf("JA %02x", pmem[1]);
+	} else if (pmem[0] == 0xe9) {
+		const uint16_t dl = pmem[1];
+		const uint16_t dh = pmem[2];
+		const uint16_t disp = (dh << 8) | dl;
+
+		printf("JMP %04x", disp);
+		pc = pc + disp;
+	}
+
+	printf("\n           ------\n");
+	return pc;
+}
+
 // Emulator entry point
-int main(int argc, char **argv)
+int main(int argc, char *argv[])
 {
 	// regs16 and reg8 point to F000:0, the start of memory-mapped registers. CS is initialised to F000
-	regs16 = (unsigned short *)(regs8 = mem + REGS_BASE);
-	regs16[REG_CS] = 0xF000;
+	regs8 = mem + REGS_BASE;
+	regs16 = (uint16_t *)regs8;
+	memw16le(regs16 + REG_CS, 0xF000);
 
 	// Trap flag off
 	regs8[FLAG_TF] = 0;
@@ -243,7 +714,7 @@ int main(int argc, char **argv)
 		disk[--file_index] = *++argv ? open(*argv, 32898) : 0;
 
 	// Set CX:AX equal to the hard disk image size, if present
-	CAST(unsigned)regs16[REG_AX] = *disk ? lseek(*disk, 0, 2) >> 9 : 0;
+	memw32le((uint32_t *)(regs16 + REG_AX), *disk ? lseek(*disk, 0, 2) >> 9 : 0);
 
 	// Load BIOS image into F000:0100, and set IP to 0100
 	read(disk[2], regs8 + (reg_ip = 0x100), 0xFF00);
@@ -251,11 +722,17 @@ int main(int argc, char **argv)
 	// Load instruction decoding helper table
 	for (int i = 0; i < 20; i++)
 		for (int j = 0; j < 256; j++)
-			bios_table_lookup[i][j] = regs8[regs16[0x81 + i] + j];
+			bios_table_lookup[i][j] = regs8[memr16le(regs16 + 0x81 + i) + j];
+
+	// first decode
+	while (memr16le(regs16 + REG_CS) != 0 || reg_ip != 0) {
+		reg_ip = decode(mem, reg_ip);
+	}
 
 	// Instruction execution loop. Terminates if CS:IP = 0:0
-	for (; opcode_stream = mem + 16 * regs16[REG_CS] + reg_ip, opcode_stream != mem;)
+	for (; opcode_stream = mem + 16 * memr16le(regs16 + REG_CS) + reg_ip, opcode_stream != mem;)
 	{
+
 		// Set up variables to prepare for decoding an opcode
 		set_opcode(*opcode_stream);
 
@@ -264,9 +741,9 @@ int main(int argc, char **argv)
 		i_d = i_reg4bit / 2 & 1;
 
 		// Extract instruction data fields
-		i_data0 = CAST(short)opcode_stream[1];
-		i_data1 = CAST(short)opcode_stream[2];
-		i_data2 = CAST(short)opcode_stream[3];
+		i_data0 = memr16le((uint16_t *) (opcode_stream + 1));
+		i_data1 = memr16le((uint16_t *) (opcode_stream + 2));
+		i_data2 = memr16le((uint16_t *) (opcode_stream + 3));
 
 		// seg_override_en and rep_override_en contain number of instructions to hold segment override and REP prefix respectively
 		if (seg_override_en)
@@ -282,11 +759,11 @@ int main(int argc, char **argv)
 			i_reg = i_data0 / 8 & 7;
 
 			if ((!i_mod && i_rm == 6) || (i_mod == 2))
-				i_data2 = CAST(short)opcode_stream[4];
+				i_data2 = memr16le((uint16_t *) (opcode_stream + 4));
 			else if (i_mod != 1)
 				i_data2 = i_data1;
 			else // If i_mod is 1, operand is (usually) 8 bits rather than 16 bits
-				i_data1 = (char)i_data1;
+				i_data1 = i_data1 & 0xff;
 
 			DECODE_RM_REG;
 		}
@@ -665,8 +1142,13 @@ int main(int argc, char **argv)
 
 		// If a timer tick is pending, interrupts are enabled, and no overrides/REP are active,
 		// then process the tick and check for new keystrokes
-		if (int8_asap && !seg_override_en && !rep_override_en && regs8[FLAG_IF] && !regs8[FLAG_TF])
-			pc_interrupt(0xA), int8_asap = 0, SDL_KEYBOARD_DRIVER;
+		if (int8_asap && !seg_override_en && !rep_override_en && regs8[FLAG_IF] && !regs8[FLAG_TF]) {
+			pc_interrupt(0xA);
+			int8_asap = 0;
+			// Keyboard driver for console. This may need changing for UNIX/non-UNIX platforms
+			printf("wait for keyboard...\n"); fflush(stdout);
+			read(0, mem + 0x4A6, 1) && (int8_asap = (mem[0x4A6] == 0x1B), pc_interrupt(7));
+		}
 	}
 
 	return 0;
