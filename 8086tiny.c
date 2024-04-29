@@ -265,7 +265,7 @@ static unsigned parity(uint8_t val) {
 }
 
 static void update_flags16(uint16_t result, unsigned carry, unsigned aux, unsigned overflow) {
-	regs8[FLAG_SF] = result & 0x8000;
+	regs8[FLAG_SF] = !!(result & 0x8000);
 	regs8[FLAG_ZF] = result == 0;
 	regs8[FLAG_PF] = parity(result);
 	regs8[FLAG_CF] = carry;
@@ -276,7 +276,7 @@ static void update_flags16(uint16_t result, unsigned carry, unsigned aux, unsign
 static void add_update_flags8(uint8_t cmp, uint8_t val) {
 	const uint8_t result = cmp + val;
 
-	regs8[FLAG_SF] = result & 0x80;
+	regs8[FLAG_SF] = !!(result & 0x80);
 	regs8[FLAG_ZF] = result == 0;
 	regs8[FLAG_PF] = parity(result);
 	regs8[FLAG_CF] = (cmp & 0x80) && (val & 0x80);
@@ -314,9 +314,107 @@ static void cmpw(uint16_t v1, uint16_t v2) {
 	add_update_flags16(v1, mv2);
 }
 
+static void cmpb(uint8_t v1, uint8_t v2) {
+	const uint8_t mv2 = -v2;
+
+	add_update_flags8(v1, mv2);
+}
+
 // jump conditional byte
 static uint16_t jcb(unsigned cond, uint8_t disp) {
 	return (cond) ? sign_extend(disp) + 2 : 2;
+}
+
+static void stos(const uint8_t w) {
+	uint16_t       di = memr16le(regs16 + REG_DI);
+	const uint16_t es = memr16le(regs16 + REG_ES);
+	uint16_t      dii = 0;
+
+	if (w) {
+		const uint16_t val = memr16le(regs16 + REG_AX);
+
+		mem[linear(es, di)] = val & 0xff;
+		mem[linear(es, di + 1)] = val >> 8;
+		dii = 2;
+	} else {
+		mem[linear(es, di)] = regs8[REG_AL];
+		dii = 1;
+	}
+
+	if (regs8[FLAG_DF]) {
+		di -= dii;
+	} else {
+		di += dii;
+	}
+	memw16le(regs16 + REG_DI, di);
+}
+
+static void movs(const uint8_t w, unsigned segment_prefix, unsigned segment) {
+	uint16_t       di   = memr16le(regs16 + REG_DI);
+	uint16_t       si   = memr16le(regs16 + REG_SI);
+	const uint16_t es   = memr16le(regs16 + REG_ES);
+	const uint16_t segn = (segment_prefix) ? segment : 3;
+	const uint16_t seg  = memr16le(regs16 + REG_ES + segn);
+	uint16_t      dii = 0;
+
+	if (w) {
+		const uint16_t val = memrw(mem + linear(seg, si));
+
+		memww(mem + linear(es, di), val);
+		dii = 2;
+	} else {
+		mem[linear(es, di)] = mem[linear(seg, si)];
+		dii = 1;
+	}
+
+	if (regs8[FLAG_DF]) {
+		di -= dii;
+		si -= dii;
+	} else {
+		di += dii;
+		si += dii;
+	}
+	memw16le(regs16 + REG_DI, di);
+	memw16le(regs16 + REG_SI, si);
+}
+
+static void push16(uint16_t val) {
+	const uint16_t sp = memr16le(regs16 + REG_SP);
+	const uint16_t ss = memr16le(regs16 + REG_SS);
+
+	memww(mem + linear(ss, sp - 2), val);
+	memw16le(regs16 + REG_SP, sp - 2);
+}
+
+static void pushf(void) {
+	const uint16_t cf = regs8[FLAG_CF];
+	const uint16_t pf = regs8[FLAG_PF];
+	const uint16_t af = regs8[FLAG_AF];
+	const uint16_t zf = regs8[FLAG_ZF];
+	const uint16_t sf = regs8[FLAG_SF];
+	const uint16_t tf = regs8[FLAG_TF];
+	const uint16_t ff = regs8[FLAG_IF];
+	const uint16_t df = regs8[FLAG_DF];
+	const uint16_t of = regs8[FLAG_OF];
+	const uint16_t flags =
+		cf | (pf << 2) | (af << 4) | (zf << 6) |
+		(sf << 7) | (tf << 8) | (ff << 9) |
+		(df << 10) | (of << 11);
+
+	push16(flags);
+}
+
+static uint16_t intr(const uint8_t v, const uint16_t pc, const uint16_t addr) {
+	const uint16_t cs = memr16le(regs16 + REG_CS);
+
+	pushf();
+	regs8[FLAG_IF] = 0;
+	regs8[FLAG_TF] = 0;
+	push16(cs);
+	memw16le(regs16 + REG_CS, memrw(mem + addr + 2));
+	push16(pc + (v) ? 2 : 1);
+
+	return memrw(mem + addr);
 }
 
 static uint16_t decode(uint8_t *mem, uint16_t pc) {
@@ -403,6 +501,8 @@ prefix:
 		const uint8_t  rm   = pmem[1] & 7;
 		const uint16_t segn = (segment_prefix) ? segment : 3;
 		const uint16_t seg  = memr16le(regs16 + REG_ES + segn);
+		const uint8_t map[] = {
+			REG_AL, REG_CL, REG_DL, REG_BL, REG_AH, REG_CH, REG_DH, REG_BH };
 
 		uint16_t pci = 2;
 
@@ -411,19 +511,23 @@ prefix:
 				const uint16_t addr = direct_addr(pmem + 2);
 
 				if (d) {
+					if (w) {
+						const uint16_t val = memrw(mem + linear(seg, addr));
+
+						memw16le(regs16 + reg, memrw(mem + linear(seg, addr)));
+						printf("MOV %s, [%s:%04x]", reg16name(reg), sregname(segn), addr);
+					} else {
+						regs8[map[reg]] = mem[linear(seg, addr)];
+						printf("MOV %s, [%s:%04x]", reg8name(map[reg]), sregname(segn), addr);
+					}
 				} else {
-					// src memory
 					if (w) {
 						const uint16_t val = memr16le(regs16 + reg);
 
-						mem[linear(seg, addr)] =  val & 0xff;
-						mem[linear(seg, addr + 1)] =  val >> 8; 
+						memww(mem + linear(seg, addr), val);
 
 						printf("MOV [%s:%04x], %s", sregname(segn), addr, reg16name(reg));
 					} else {
-						uint8_t map[] = {
-							REG_AL, REG_CL, REG_DL, REG_BL, REG_AH, REG_CH, REG_DH, REG_BH };
-
 						mem[linear(seg, addr)] = regs8[map[reg]];
 						printf("MOV [%s:%04x], %s", sregname(segn), addr, reg8name(map[reg]));
 					}
@@ -437,9 +541,11 @@ prefix:
 				if (w) {
 					memw16le(regs16 + rm, memr16le(regs16 + reg));
 					printf("MOV %s, %s", reg16name(rm), reg16name(reg));
-					pci = 2;
 				} else {
+					regs8[map[rm]] = regs8[map[reg]];
+					printf("MOV %s, %s", reg8name(map[rm]), reg8name(map[reg]));
 				}
+				pci = 2;
 			}
 		}
 
@@ -473,6 +579,22 @@ prefix:
 		}
 
 		pc = pc + pci;
+	} else if ((pmem[0] & (~1)) == 0xa0) {
+		const uint8_t  w    = pmem[0] & 1;
+		const uint16_t segn = (segment_prefix) ? segment : 3;
+		const uint16_t seg  = memr16le(regs16 + REG_ES + segn);
+		const uint16_t addr = memrw(pmem + 1);
+
+		if (w) {
+			const uint16_t val = memr16le(regs16 + REG_AX);
+
+			memww(mem + linear(seg, addr), val);
+			printf("MOV AX, [%s:%04x]", sregname(segn), addr);
+		} else {
+			regs8[REG_AL] = mem[linear(seg, addr)];
+			printf("MOV AL, [%s:%04x]", sregname(segn), addr);
+		}
+		pc = pc + 3;
 	} else if ((pmem[0] & (~1)) == 0xa2) {
 		const uint8_t  w    = pmem[0] & 1;
 		const uint16_t segn = (segment_prefix) ? segment : 3;
@@ -489,6 +611,25 @@ prefix:
 			printf("MOV [%s:%04x], AL", sregname(segn), addr);
 		}
 		pc = pc + 3;
+	} else if ((pmem[0] & (~1)) == 0xa4) {
+		const uint8_t w = pmem[0] & 1;
+
+		if (repeat_prefix) {
+			uint16_t cx = memr16le(regs16 + REG_CX);
+
+			while (cx) {
+				movs(w, segment_prefix, segment);
+				cx--;
+				memw16le(regs16 + REG_CX, cx);
+			}
+
+			printf("REP MOVS%c", (w) ? 'W' : 'B');
+		} else {
+			movs(w, segment_prefix, segment);
+			printf("MOVS%c", (w) ? 'W' : 'B');
+		}
+
+		pc++;
 	} else if ((pmem[0] & (~0x18)) == 0x06) {
 		const uint8_t sreg = (pmem[0] >> 3) & 3;
 		const uint16_t val = memr16le(regs16 + REG_ES + sreg);
@@ -503,6 +644,21 @@ prefix:
 		printf("PUSH %s", sregname(sreg));
 
 		pc = pc + 1;
+	} else if (pmem[0] == 0x0f) {
+		if (pmem[1] == 0x01) {
+			time_t       clock_buf;
+			struct timeb ms_clock;
+			const uint16_t es = memr16le(regs16 + REG_ES);
+			const uint16_t bx = memr16le(regs16 + REG_BX);
+
+			time(&clock_buf);
+			ftime(&ms_clock);
+			memcpy(mem + linear(es, bx), localtime(&clock_buf), sizeof(struct tm));
+			memww(mem + linear(es, bx + 36), ms_clock.millitm);
+
+			printf("SYS RTC");
+		}
+		pc = pc + 2;
 	} else if ((pmem[0] & (~0x18)) == 0x07) {
 		const uint8_t sreg = (pmem[0] >> 3) & 3;
 		const uint16_t sp  = memr16le(regs16 + REG_SP);
@@ -517,6 +673,26 @@ prefix:
 		printf("POP %s", sregname(sreg));
 
 		pc = pc + 1;
+	} else if (pmem[0] == 0x9d) {
+		const uint16_t sp = memr16le(regs16 + REG_SP);
+		const uint16_t ss = memr16le(regs16 + REG_SS);
+		const uint16_t vl = mem[linear(ss, sp)];
+		const uint16_t vh = mem[linear(ss, sp + 1)];
+
+		regs8[FLAG_CF] = vl & 1;
+		regs8[FLAG_PF] = !!(vl & 4);
+		regs8[FLAG_AF] = !!(vl & 0x10);
+		regs8[FLAG_ZF] = !!(vl & 0x40);
+		regs8[FLAG_SF] = !!(vl & 0x80);
+
+		regs8[FLAG_TF] = vh & 1;
+		regs8[FLAG_IF] = !!(vh & 2);
+		regs8[FLAG_DF] = !!(vh & 4);
+		regs8[FLAG_OF] = !!(vh & 8);
+		memw16le(regs16 + REG_SP, sp + 2);
+
+		printf("POPF");
+		pc++;
 	} else if ((pmem[0] & (~7)) == 0x58) {
 		const uint8_t  reg = pmem[0] & 7;
 		const uint16_t sp  = memr16le(regs16 + REG_SP);
@@ -568,32 +744,25 @@ prefix:
 
 		pc = pc + 2;
 	} else if ((pmem[0] & (~1)) == 0xaa) {
-		const uint8_t   w = pmem[0] & 1;
-		uint16_t       di = memr16le(regs16 + REG_DI);
-		const uint16_t es = memr16le(regs16 + REG_ES);
-		uint16_t      dii = 0;
+		const uint8_t w = pmem[0] & 1;
 
-		if (w) {
-			const uint16_t val = memr16le(regs16 + REG_AX);
+		if (repeat_prefix) {
+			uint16_t cx = memr16le(regs16 + REG_CX);
 
-			mem[linear(es, di)] = val & 0xff;
-			mem[linear(es, di + 1)] = val >> 8;
-			dii = 2;
+			while (cx) {
+				stos(w);
+				cx--;
+				memw16le(regs16 + REG_CX, cx);
+			}
+
+			printf("REP STOS%c", (w) ? 'W' : 'B');
+			repeat_prefix = 0;
 		} else {
-			mem[linear(es, di)] = regs8[REG_AL];
-			dii = 1;
+			stos(w);
+			printf("STOS%c", (w) ? 'W' : 'B');
 		}
 
-		if (regs8[FLAG_DF]) {
-			di -= dii;
-		} else {
-			di += dii;
-		}
-		memw16le(regs16 + REG_DI, di);
-
-		// FIXME: REP+LOCK prefix
-		printf("STOS%c", (w) ? 'W' : 'B');
-		pc = pc + 1;
+		pc++;
 	} else if ((pmem[0] & (~0x18)) == 0x26) {
 		segment = (pmem[0] >> 3) & 3;
 		segment_prefix = 1;
@@ -645,13 +814,10 @@ prefix:
 					} else {
 					}
 				} else {
-					const uint8_t val = -pmem[4];
 					const uint8_t cmp = mem[linear(seg, addr)];
-					const uint8_t result = cmp + val;
 
-					add_update_flags8(cmp, val);
-
-					printf("CMP BYTE [%s:%04x], %02x", sregname(segn), addr, val);
+					cmpb(cmp, pmem[4]);
+					printf("CMP BYTE [%s:%04x], %02x", sregname(segn), addr, pmem[4]);
 					pci = 5;
 				}
 			} else {
@@ -671,16 +837,77 @@ prefix:
 				cmpw(v1, v2);
 				printf("CMP %s, %04x", reg16name(rm), v2);
 			} else {
+				uint8_t map[] = {
+					REG_AL, REG_CL, REG_DL, REG_BL, REG_AH, REG_CH, REG_DH, REG_BH };
+
+				cmpb(regs8[map[rm]], pmem[2]);
+				printf("CMP %s, %02x", reg8name(map[rm]), pmem[2]);
+				pci = 3;
 			}
+		}
+
+		pc = pc + pci;
+	} else if ((pmem[0] & (~3)) == 0x38) {
+		const uint8_t  d    = (pmem[0] >> 1) & 1;
+		const uint8_t  w    = pmem[0] & 1;
+		const uint8_t  mod  = pmem[1] >> 6;
+		const uint8_t  reg  = (pmem[1] >> 3) & 7;
+		const uint8_t  rm   = pmem[1] & 7;
+		const uint16_t segn = (segment_prefix) ? segment : 3;
+		const uint16_t seg  = memr16le(regs16 + REG_ES + segn);
+		uint16_t pci = 0;
+
+		if (mod == 0) {
+			if (rm == 6) {
+				const uint16_t addr = direct_addr(pmem + 2);
+
+				if (d) {
+					if (w) {
+					} else {
+						uint8_t map[] = {
+							REG_AL, REG_CL, REG_DL, REG_BL, REG_AH, REG_CH, REG_DH, REG_BH };
+
+						// here...
+						cmpb(regs8[map[reg]], mem[linear(seg, addr)]);
+						printf("CMP %s, [%s:%04x]", reg8name(map[reg]), sregname(segn), addr);
+					}
+				}
+
+				pci = 4;
+			}
+		}
+
+		pc = pc + pci;
+	} else if ((pmem[0] & (~1)) == 0x3c) {
+		const uint8_t w = pmem[0] & 1;
+		unsigned pci = 0;
+
+		if (w) {
+			const uint16_t val = memrw(pmem + 1);
+			const uint16_t ax = memr16le(regs16 + REG_AX);
+
+			cmpw(ax, val);
+			printf("CMP AX, %04x", val);
+			pci = 3;
+		} else {
+			cmpb(regs8[REG_AL], pmem[1]);
+			printf("CMP AL, %02x", pmem[1]);
+			pci = 2;
 		}
 
 		pc = pc + pci;
 	} else if (pmem[0] == 0x74) {
 		pc = pc + jcb(regs8[FLAG_ZF], pmem[1]);
 		printf("JZ %02x", pmem[1]);
+	} else if (pmem[0] == 0x75) {
+		pc = pc + jcb(!regs8[FLAG_ZF], pmem[1]);
+		printf("JNZ %02x", pmem[1]);
 	} else if (pmem[0] == 0x77) {
 		pc = pc + jcb(regs8[FLAG_ZF] && regs8[FLAG_CF], pmem[1]);
 		printf("JA %02x", pmem[1]);
+	} else if (pmem[0] == 0x7c) {
+		pc = pc + jcb(regs8[FLAG_SF] != regs8[FLAG_OF], pmem[1]);
+		printf("JL %02x", pmem[1]);
 	} else if (pmem[0] == 0xe9) {
 		const uint16_t dl = pmem[1];
 		const uint16_t dh = pmem[2];
@@ -688,6 +915,142 @@ prefix:
 
 		printf("JMP %04x", disp);
 		pc = pc + disp;
+	} else if ((pmem[0] & (~1)) == 0xfe) {
+		const uint8_t  w   = pmem[0] & 1;
+		const uint8_t  mod = pmem[1] >> 6;
+		const uint8_t  reg = (pmem[1] >> 3) & 7;
+		const uint8_t  rm  = pmem[1] & 7;
+		const uint16_t segn = (segment_prefix) ? segment : 3;
+		const uint16_t seg  = memr16le(regs16 + REG_ES + segn);
+		uint16_t pci = 0;
+
+		if (mod == 0) {
+			if (rm == 6) {
+				const uint16_t addr = direct_addr(pmem + 2);
+
+				if (w) {
+					const uint16_t val = memrw(mem + linear(seg, addr));
+
+					memww(mem + linear(seg, addr), val - 1);
+					printf("DEC WORD [%s:%04x]", sregname(segn), addr);
+				} else {
+					const uint8_t val = mem[linear(seg, addr)];
+
+					mem[linear(seg, addr)] = val - 1;
+					printf("DEC BYTE [%s:%04x]", sregname(segn), addr);
+				}
+				pci = 4;
+			}
+		}
+
+		pc = pc + pci;
+	} else if ((pmem[0] & (~7)) == 0x40) {
+		const uint8_t  reg = pmem[0] & 7;
+		const uint16_t val = memr16le(regs16 + reg);
+
+		memw16le(regs16 + reg, val + 1);
+		printf("INC %s", reg16name(reg));
+
+		pc++;
+	} else if ((pmem[0] & (~1)) == 0xcc) {
+		const uint8_t v = pmem[0] & 1;
+		uint16_t addr = 0;
+
+		if (v) {
+			const uint16_t val = pmem[1];
+
+			addr = 4 * val;
+			printf("INT %02x", pmem[1]);
+		} else {
+			addr = 0x00c;
+			printf("INT");
+		}
+
+		pc = intr(v, pc, addr);
+	} else if (pmem[0] == 0xe8) {
+		const uint16_t disp = memrw(pmem + 1);
+
+		push16(pc + 3);
+		printf("CALL %04x", disp);
+		pc = pc + disp + 3;
+	} else if ((pmem[0] & (~3)) == 0xd0) {
+		const uint8_t  w   = pmem[0] & 1;
+		const uint8_t  c   = (pmem[0] >> 1) & 1;
+		const uint8_t  mod = pmem[1] >> 6;
+		const uint8_t  reg = (pmem[1] >> 3) & 7;
+		const uint8_t  rm  = pmem[1] & 7;
+		const uint16_t segn = (segment_prefix) ? segment : 3;
+		const uint16_t seg  = memr16le(regs16 + REG_ES + segn);
+		uint16_t pci = 0;
+
+		if (mod == 3) {
+			if (c) {
+				if (w) {
+				} else {
+					uint8_t map[] = {
+						REG_AL, REG_CL, REG_DL, REG_BL, REG_AH, REG_CH, REG_DH, REG_BH };
+					uint8_t bits = regs8[REG_CL];
+					uint8_t val = regs8[map[rm]];
+					uint8_t i;
+
+					if (reg == 5) {
+						while (bits) {
+							val = val >> 1;
+							bits--;
+						}
+
+						regs8[map[rm]] = val;
+						printf("SHR %s, CL", reg8name(map[rm]));
+						pci = 2;
+					}
+				}
+			} else {
+				if (w) {
+					const uint16_t val = memr16le(regs16 + rm);
+
+					if (reg == 4) {
+						memw16le(regs16 + rm, val << 1);
+						printf("SHL %s, 1", reg16name(rm));
+						pci = 2;
+					}
+				}
+			}
+		}
+		pc = pc + pci;
+	} else if ((pmem[0] & (~7)) == 0x90) {
+		const uint8_t reg = pmem[0] & 7;
+		const uint16_t v1 = memr16le(regs16 + REG_AX);
+		const uint16_t v2 = memr16le(regs16 + reg);
+
+		memw16le(regs16 + REG_AX, v2);
+		memw16le(regs16 + reg, v1);
+
+		printf("XCHG AX, %s", reg16name(reg));
+		pc++;
+	} else if ((pmem[0] & (~1)) == 0x86) {
+		const uint8_t  w    = pmem[0] & 1;
+		const uint8_t  mod  = pmem[1] >> 6;
+		const uint8_t  reg  = (pmem[1] >> 3) & 7;
+		const uint8_t  rm   = pmem[1] & 7;
+		const uint16_t segn = (segment_prefix) ? segment : 3;
+		const uint16_t seg  = memr16le(regs16 + REG_ES + segn);
+		uint16_t pci = 0;
+
+		if (mod == 3) {
+			if (w) {
+			} else {
+				const uint8_t map[] = {
+					REG_AL, REG_CL, REG_DL, REG_BL, REG_AH, REG_CH, REG_DH, REG_BH };
+				const uint8_t v1 = regs8[map[reg]];
+				const uint8_t v2 = regs8[map[rm]];
+
+				regs8[map[rm]]  = v1;
+				regs8[map[reg]] = v2;
+				printf("XCHG %s, %s", reg8name(map[reg]), reg8name(map[rm]));	
+				pci = 2;
+			}
+		}
+		pc = pc + pci;
 	}
 
 	printf("\n           ------\n");
@@ -726,7 +1089,13 @@ int main(int argc, char *argv[])
 
 	// first decode
 	while (memr16le(regs16 + REG_CS) != 0 || reg_ip != 0) {
+		const uint16_t old_reg_ip = reg_ip;
+
 		reg_ip = decode(mem, reg_ip);
+		if (reg_ip == old_reg_ip) {
+			printf("\nINFINITE LOOP\n");
+			return 0;
+		}
 	}
 
 	// Instruction execution loop. Terminates if CS:IP = 0:0
